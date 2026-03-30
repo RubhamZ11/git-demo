@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OIDC Testing (Authorization Code + PKCE)</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 980px; margin: 24px auto; padding: 0 16px; }
+    h1 { margin-bottom: 4px; }
+    .muted { color: #666; margin-top: 0; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ddd; background: #fafafa; cursor: pointer; }
+    button:hover { background: #f1f1f1; }
+    .card { border: 1px solid #e6e6e6; border-radius: 14px; padding: 14px; margin: 12px 0; }
+    pre { background: #0b1020; color: #d5e2ff; padding: 12px; border-radius: 12px; overflow: auto; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    input { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ddd; }
+    label { display: block; font-weight: 600; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>OIDC Testing Page</h1>
+  <p class="muted">Authorization Code Flow + PKCE (Recommended). Works with Okta/Auth0/Azure AD/Keycloak/etc.</p>
+
+  <div class="card">
+    <h2>Configuration</h2>
+    <p class="muted">Fill these values based on your OIDC provider settings.</p>
+
+    <label>Authority / Issuer URL (e.g., https://TENANT/... or https://YOUR-KEYCLOAK/realms/REALM)</label>
+    <input id="authority" placeholder="https://example.com/realms/myrealm" />
+
+    <label>Client ID</label>
+    <input id="clientId" placeholder="your-client-id" />
+
+    <label>Redirect URI (must be registered in IdP)</label>
+    <input id="redirectUri" placeholder="http://localhost:5500/index.html" />
+
+    <label>Post Logout Redirect URI (must be registered in IdP)</label>
+    <input id="postLogoutRedirectUri" placeholder="http://localhost:5500/index.html" />
+
+    <label>Scopes (space separated)</label>
+    <input id="scopes" value="openid profile email" />
+
+    <div class="row">
+      <button id="saveBtn">Save Config</button>
+      <button id="clearBtn">Clear Saved Config</button>
+    </div>
+    <p class="muted">
+      Tip: Config is saved in <code>localStorage</code> for convenience.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Actions</h2>
+    <div class="row">
+      <button id="loginBtn">Login (OIDC)</button>
+      <button id="silentRenewBtn">Silent Renew</button>
+      <button id="userinfoBtn">Call UserInfo</button>
+      <button id="logoutBtn">Logout</button>
+    </div>
+    <div class="row">
+      <button id="getUserBtn">Get Current User</button>
+      <button id="clearStateBtn">Clear OIDC State</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Status / Output</h2>
+    <pre id="output">Ready.</pre>
+  </div>
+
+  <!-- OIDC Client library -->
+  <script type="module">
+    import {
+      UserManager,
+      WebStorageStateStore,
+      Log
+    } from "https://cdn.jsdelivr.net/npm/oidc-client-ts@3.0.1/dist/browser/oidc-client-ts.min.js";
+
+    const $ = (id) => document.getElementById(id);
+    const out = $("output");
+
+    function log(msg, obj) {
+      const ts = new Date().toISOString();
+      const text = typeof obj === "undefined" ? msg : msg + "\\n" + JSON.stringify(obj, null, 2);
+      out.textContent = `[${ts}] ${text}`;
+      console.log(msg, obj ?? "");
+    }
+
+    const CONFIG_KEY = "oidc_test_config_v1";
+
+    function loadConfig() {
+      const saved = localStorage.getItem(CONFIG_KEY);
+      if (saved) return JSON.parse(saved);
+
+      // Defaults: best effort guess based on current location
+      const origin = window.location.origin;
+      return {
+        authority: "",
+        clientId: "",
+        redirectUri: origin + window.location.pathname,
+        postLogoutRedirectUri: origin + window.location.pathname,
+        scopes: "openid profile email"
+      };
+    }
+
+    function fillInputs(cfg) {
+      $("authority").value = cfg.authority || "";
+      $("clientId").value = cfg.clientId || "";
+      $("redirectUri").value = cfg.redirectUri || "";
+      $("postLogoutRedirectUri").value = cfg.postLogoutRedirectUri || "";
+      $("scopes").value = cfg.scopes || "openid profile email";
+    }
+
+    function readInputs() {
+      return {
+        authority: $("authority").value.trim(),
+        clientId: $("clientId").value.trim(),
+        redirectUri: $("redirectUri").value.trim(),
+        postLogoutRedirectUri: $("postLogoutRedirectUri").value.trim(),
+        scopes: $("scopes").value.trim() || "openid profile email"
+      };
+    }
+
+    function validate(cfg) {
+      const missing = [];
+      if (!cfg.authority) missing.push("authority/issuer");
+      if (!cfg.clientId) missing.push("clientId");
+      if (!cfg.redirectUri) missing.push("redirectUri");
+      if (!cfg.postLogoutRedirectUri) missing.push("postLogoutRedirectUri");
+      if (missing.length) throw new Error("Missing: " + missing.join(", "));
+    }
+
+    function createUserManager(cfg) {
+      // Helpful debug logging
+      Log.setLogger(console);
+      Log.setLevel(Log.INFO);
+
+      return new UserManager({
+        authority: cfg.authority,
+        client_id: cfg.clientId,
+        redirect_uri: cfg.redirectUri,
+        post_logout_redirect_uri: cfg.postLogoutRedirectUri,
+        response_type: "code", // Authorization Code Flow
+        scope: cfg.scopes,
+        automaticSilentRenew: false, // manual button
+        // "sessionStorage" avoids stale state between tabs; you can change to localStorage if needed
+        userStore: new WebStorageStateStore({ store: window.sessionStorage }),
+        stateStore: new WebStorageStateStore({ store: window.sessionStorage })
+      });
+    }
+
+    async function handleRedirectCallbackIfPresent(mgr) {
+      // If redirected back from IdP with code/state, process it.
+      const url = new URL(window.location.href);
+      const hasAuthParams = url.searchParams.get("code") && url.searchParams.get("state");
+
+      if (!hasAuthParams) return;
+
+      try {
+        const user = await mgr.signinRedirectCallback();
+        log("✅ Redirect callback processed. Logged in user:", {
+          profile: user.profile,
+          expires_at: user.expires_at,
+          scopes: user.scope
+        });
+
+        // Clean URL (remove ?code=...&state=...)
+        window.history.replaceState({}, document.title, url.origin + url.pathname);
+      } catch (e) {
+        log("❌ Error in redirect callback:", { message: e.message, error: String(e) });
+      }
+    }
+
+    async function main() {
+      const cfg = loadConfig();
+      fillInputs(cfg);
+
+      const mgr = createUserManager(cfg);
+      await handleRedirectCallbackIfPresent(mgr);
+
+      // Wire up buttons
+      $("saveBtn").onclick = () => {
+        try {
+          const c = readInputs();
+          validate(c);
+          localStorage.setItem(CONFIG_KEY, JSON.stringify(c));
+          log("✅ Config saved to localStorage.", c);
+        } catch (e) {
+          log("❌ Cannot save config:", { message: e.message });
+        }
+      };
+
+      $("clearBtn").onclick = () => {
+        localStorage.removeItem(CONFIG_KEY);
+        const c = loadConfig();
+        fillInputs(c);
+        log("🧹 Saved config cleared.");
+      };
+
+      $("loginBtn").onclick = async () => {
+        try {
+          const c = readInputs();
+          validate(c);
+
+          // Recreate manager from latest config
+          const m = createUserManager(c);
+          log("➡️ Redirecting to IdP for login...");
+          await m.signinRedirect();
+        } catch (e) {
+          log("❌ Login failed to start:", { message: e.message, error: String(e) });
+        }
+      };
+
+      $("logoutBtn").onclick = async () => {
+        try {
+          const c = readInputs();
+          validate(c);
+          const m = createUserManager(c);
+
+          log("➡️ Redirecting to IdP for logout...");
+          await m.signoutRedirect();
+        } catch (e) {
+          log("❌ Logout failed to start:", { message: e.message, error: String(e) });
+        }
+      };
+
+      $("getUserBtn").onclick = async () => {
+        try {
+          const c = readInputs();
+          validate(c);
+          const m = createUserManager(c);
+
+          const user = await m.getUser();
+          if (!user) {
+            log("ℹ️ No user in storage (not logged in yet).");
+            return;
+          }
+
+          log("👤 Current user:", {
+            profile: user.profile,
+            id_token_present: !!user.id_token,
+            access_token_present: !!user.access_token,
+            expires_at: user.expires_at,
+            scope: user.scope
+          });
+        } catch (e) {
+          log("❌ GetUser failed:", { message: e.message, error: String(e) });
+        }
+      };
+
+      $("userinfoBtn").onclick = async () => {
+        try {
+          const c = readInputs();
+          validate(c);
+          const m = createUserManager(c);
+
+          const user = await m.getUser();
+          if (!user || !user.access_token) {
+            log("⚠️ No access token available. Login first and ensure scope includes 'openid'.");
+            return;
+          }
+
+          const userInfo = await m.querySessionStatus().catch(() => null);
+          // Note: Some IdPs require a dedicated /userinfo call; oidc-client-ts doesn't always wrap it.
+          // We'll call it manually:
+          const wellKnown = await fetch(c.authority.replace(/\/$/, "") + "/.well-known/openid-configuration").then(r => r.json());
+          const resp = await fetch(wellKnown.userinfo_endpoint, {
+            headers: { Authorization: `Bearer ${user.access_token}` }
+          });
+
+          const data = await resp.json();
+          log("✅ UserInfo response:", data);
+        } catch (e) {
+          log("❌ UserInfo failed:", { message: e.message, error: String(e) });
+        }
+      };
+
+      $("silentRenewBtn").onclick = async () => {
+        try {
+          const c = readInputs();
+          validate(c);
+          const m = createUserManager(c);
+
+          log("🔄 Attempting silent renew (popup-based) ...");
+          const user = await m.signinSilent().catch(async () => {
+            // Fallback for IdPs without silent iframe support: popup
+            return await m.signinPopup();
+          });
+
+          log("✅ Renew successful:", {
+            expires_at: user.expires_at,
+            scope: user.scope
+          });
+        } catch (e) {
+          log("❌ Silent renew failed:", { message: e.message, error: String(e) });
+        }
+      };
+
+      $("clearStateBtn").onclick = async () => {
+        try {
+          const c = readInputs();
+          validate(c);
+          const m = createUserManager(c);
+
+          await m.clearStaleState();
+          await m.removeUser();
+          log("🧹 Cleared stale state and removed user from storage.");
+        } catch (e) {
+          log("❌ Clear state failed:", { message: e.message, error: String(e) });
+        }
+      };
+
+      log("✅ Page loaded. Configure OIDC settings and click Login.");
+    }
+
+    main();
+  </script>
+</body>
+</html>
